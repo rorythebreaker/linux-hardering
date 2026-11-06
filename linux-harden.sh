@@ -20,7 +20,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="2.0"
+VERSION="2.2"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="/var/log/linux-harden-${STAMP}.log"
 BACKUP_ROOT="/root"
@@ -50,6 +50,7 @@ ADMIN_PASS=""
 ADMIN_PASS_HASH=""
 KEY_SOURCE="skip"           # root | paste | skip
 PUBKEY=""
+PUBKEYS="" # Multiple public keys separated by |; never store private keys
 CURRENT_SSH_PORT="22"
 SSH_PORT=""
 SSH_ROOT="no"               # no | prohibit-password
@@ -68,7 +69,7 @@ PW_MINLEN="12"
 DISABLE_SERVICES=""
 HAS_DOCKER=0
 
-CONFIG_KEYS="LANG_UI MODULES UTILS TIMEZONE ADMIN_USER ADMIN_PASS ADMIN_PASS_HASH KEY_SOURCE PUBKEY SSH_PORT SSH_ROOT SSH_PASSAUTH SSH_MAXAUTH SSH_ALIVE SSH_ALLOWUSERS EXTRA_PORTS DOCKER_MODE DOCKER_PORTS DOCKER_RESTART F2B_BANTIME F2B_MAXRETRY AUTO_REBOOT PW_MINLEN DISABLE_SERVICES"
+CONFIG_KEYS="LANG_UI MODULES UTILS TIMEZONE ADMIN_USER ADMIN_PASS ADMIN_PASS_HASH KEY_SOURCE PUBKEY PUBKEYS SSH_PORT SSH_ROOT SSH_PASSAUTH SSH_MAXAUTH SSH_ALIVE SSH_ALLOWUSERS EXTRA_PORTS DOCKER_MODE DOCKER_PORTS DOCKER_RESTART F2B_BANTIME F2B_MAXRETRY AUTO_REBOOT PW_MINLEN DISABLE_SERVICES"
 
 declare -a RESULTS=()
 
@@ -177,6 +178,15 @@ ufw_active() { ufw status 2>/dev/null | grep -q 'Status: active'; }
 num()        { [[ $1 =~ ^[0-9]+$ ]]; }
 yn()         { [[ $1 == yes || $1 == no ]]; }
 valid_port() { num "$1" && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_pubkeys() {
+    local item
+    local -a items
+    IFS='|' read -r -a items <<< "$1"
+    ((${#items[@]} > 0)) || return 1
+    for item in "${items[@]}"; do
+        [[ -n $item ]] && valid_pubkey "$item" || return 1
+    done
+}
 valid_pubkey() { [[ $1 =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+)\ [A-Za-z0-9+/=]+ ]]; }
 valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ && $1 != root ]]; }
 valid_portlist() {   # "80/tcp,443/tcp,8000:8010/tcp" (empty is fine)
@@ -224,6 +234,9 @@ ask() {
 ensure_whiptail() {
     command -v whiptail >/dev/null && return 0
     echo "Installing whiptail..."
+    if ((DRY_RUN)); then
+        die "whiptail is required for interactive dry-run; install it manually or use --config"
+    fi
     apt-get update -q >>"$LOG_FILE" 2>&1 && apt-get install -y -q whiptail >>"$LOG_FILE" 2>&1 \
         || die "Cannot install whiptail"
 }
@@ -259,6 +272,7 @@ ADMIN_USER='admin'
 ADMIN_PASS_HASH='$6$CHANGE_ME'
 KEY_SOURCE='paste'                 # root | paste | skip
 PUBKEY='ssh-ed25519 AAAA...your-key... you@pc'
+PUBKEYS='' # Optional: ssh-ed25519 AAAA... pc1|ssh-ed25519 AAAA... pc2
 
 SSH_PORT='822'                     # <1024, otherwise vps-audit reports FAIL
 SSH_ROOT='no'                      # no | prohibit-password
@@ -350,9 +364,10 @@ validate_params() {
         [[ $ADMIN_PASS_HASH == *CHANGE_ME* ]] && e+=("ADMIN_PASS_HASH: $(tr_ 'замените пример' 'replace the example')")
         case $KEY_SOURCE in
             root|skip) ;;
-            paste) valid_pubkey "$PUBKEY" || e+=("PUBKEY: $(tr_ 'не похоже на публичный ключ' 'not a public key')") ;;
+            paste) { valid_pubkey "$PUBKEY" || [[ -z $PUBKEY && -n $PUBKEYS ]]; } || e+=("PUBKEY: $(tr_ 'не похоже на публичный ключ' 'not a public key')") ;;
             *) e+=("KEY_SOURCE: root | paste | skip") ;;
         esac
+        [[ -z $PUBKEYS ]] || valid_pubkeys "$PUBKEYS" || e+=("PUBKEYS: invalid public key list")
     fi
     if has ssh; then
         if ! valid_port "$SSH_PORT"; then e+=("SSH_PORT: '$SSH_PORT'")
@@ -501,6 +516,16 @@ IMPORTANT: keep this SSH session open until you verify login in a new one.")"
                 PUBKEY=$(ui_input "$(tr_ 'SSH-ключ' 'SSH key')" "$(tr_ 'Вставьте публичный ключ одной строкой' 'Paste the public key as one line')" "") || abort
                 valid_pubkey "$PUBKEY" && break
                 ui_msg "!" "$(tr_ 'Это не похоже на публичный SSH-ключ' 'That does not look like a public SSH key')"
+            done
+        fi
+        if [[ $KEY_SOURCE == paste ]]; then
+            while ui_yesno "$(tr_ 'SSH-ключи' 'SSH keys')" "$(tr_ 'Добавить ещё один публичный ключ?' 'Add another public key?')"; do
+                while :; do
+                    local_key=$(ui_input "$(tr_ 'SSH-ключ' 'SSH key')" "$(tr_ 'Вставьте следующий публичный ключ' 'Paste the next public key')" "") || abort
+                    valid_pubkey "$local_key" && break
+                    ui_msg "!" "$(tr_ 'Недопустимый ключ' 'Invalid public key')"
+                done
+                PUBKEYS+="${PUBKEYS:+|}$local_key"
             done
         fi
     fi
@@ -664,8 +689,19 @@ mod_user() {
                 warn "$(tr_ '/root/.ssh/authorized_keys пуст или отсутствует' '/root/.ssh/authorized_keys is empty or missing')"; return 2
             fi ;;
         paste)
-            if ((DRY_RUN)); then echo "[dry-run] append key -> $ak"
-            else grep -qxF -- "$PUBKEY" "$ak" 2>/dev/null || echo "$PUBKEY" >> "$ak"; fi ;;
+            local key
+            local -a keys=()
+            [[ -z $PUBKEY ]] || keys+=("$PUBKEY")
+            if [[ -n $PUBKEYS ]]; then
+                local -a extra_keys
+                IFS='|' read -r -a extra_keys <<< "$PUBKEYS"
+                keys+=("${extra_keys[@]}")
+            fi
+            for key in "${keys[@]}"; do
+                valid_pubkey "$key" || return 1
+                if ((DRY_RUN)); then echo "[dry-run] append public key -> $ak"
+                else grep -qxF -- "$key" "$ak" 2>/dev/null || printf '%s\n' "$key" >> "$ak" || return 1; fi
+            done ;;
     esac
     if [[ -f $ak ]] && ! ((DRY_RUN)); then chown "$ADMIN_USER:$ADMIN_USER" "$ak"; chmod 600 "$ak"; fi
     ok "$ADMIN_USER: sudo, $home 700"
@@ -695,20 +731,20 @@ mod_firewall() {
         backup "$f"
     done
     ufw_active || record_action "ufw_was_inactive"
-    run ufw default deny incoming
-    run ufw default allow outgoing
-    run ufw allow "${SSH_PORT}/tcp" comment 'SSH'
+    run ufw default deny incoming || return 1
+    run ufw default allow outgoing || return 1
+    run ufw allow "${SSH_PORT}/tcp" comment 'SSH' || return 1
     if [[ $SSH_PORT != "$CURRENT_SSH_PORT" ]]; then
         # keep the old port open so the current session survives; remove after testing
-        run ufw allow "${CURRENT_SSH_PORT}/tcp" comment 'SSH old - remove after check'
+        run ufw allow "${CURRENT_SSH_PORT}/tcp" comment 'SSH old - remove after check' || return 1
         warn "$(tr_ "Старый порт $CURRENT_SSH_PORT оставлен открытым. После проверки: ufw delete allow $CURRENT_SSH_PORT/tcp" \
                     "Old port $CURRENT_SSH_PORT left open. After testing: ufw delete allow $CURRENT_SSH_PORT/tcp")"
         rc=2
     fi
     IFS=',' read -ra ports <<< "$EXTRA_PORTS"
-    for p in "${ports[@]}"; do p=${p// /}; [[ -n $p ]] && run ufw allow "$p"; done
+    for p in "${ports[@]}"; do p=${p// /}; if [[ -n $p ]]; then run ufw allow "$p" || return 1; fi; done
     run ufw --force enable || return 1
-    run ufw status verbose
+    run ufw status verbose || return 1
     if ((HAS_DOCKER)) && ! has docker; then
         warn "$(tr_ 'Docker найден: опубликованные порты контейнеров обходят UFW. Запустите модуль docker.' \
                     'Docker found: published container ports bypass UFW. Run the docker module.')"
@@ -831,7 +867,7 @@ mod_ssh() {
             home=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
             [[ -s $home/.ssh/authorized_keys ]] && keys_ok=1
         fi
-        [[ $root != no && -s /root/.ssh/authorized_keys ]] && keys_ok=1
+        [[ $root != no && $SSH_ALLOWUSERS != yes && -s /root/.ssh/authorized_keys ]] && keys_ok=1
         ((DRY_RUN)) && [[ $KEY_SOURCE != skip ]] && keys_ok=1
         if ((keys_ok == 0)); then
             warn "$(tr_ 'Ключи не найдены — вход по паролю ОСТАВЛЕН включённым' 'No keys found — password login is LEFT enabled')"
@@ -901,7 +937,7 @@ EOF
     if ! ((DRY_RUN)) && ! fail2ban-client -t >>"$LOG_FILE" 2>&1; then
         err "fail2ban-client -t"; return 1
     fi
-    run systemctl enable fail2ban
+    run systemctl enable fail2ban || return 1
     run systemctl restart fail2ban || return 1
     ((DRY_RUN)) || { sleep 2; fail2ban-client status sshd; }
 }
@@ -920,7 +956,7 @@ Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 EOF
     fi
-    run systemctl enable --now unattended-upgrades
+    run systemctl enable --now unattended-upgrades || return 1
 }
 
 mod_pwquality() {
@@ -1033,6 +1069,7 @@ mod_vpsaudit() {
     ((DRY_RUN)) && { echo "[dry-run] curl $VPS_AUDIT_URL && bash vps-audit.sh"; return 0; }
     command -v curl >/dev/null || apt_install curl
     mkdir -p /root/vps-audit && cd /root/vps-audit || return 1
+    warn "Executing third-party code as root from an unpinned URL; review the source before enabling this module."
     curl -fsSL "$VPS_AUDIT_URL" -o vps-audit.sh || return 1
     bash vps-audit.sh | tee -a "$LOG_FILE"
     cd - >/dev/null || true
@@ -1131,9 +1168,8 @@ $(tr_ 'Продолжить?' 'Continue?')" || abort
         if ((ufw_off)); then run ufw --force disable
         elif ufw_active; then run ufw reload; fi
     fi
-    if ((docker_rules)) && command -v iptables >/dev/null; then
-        # rules from after.rules stay in DOCKER-USER after ufw reload
-        run iptables -F DOCKER-USER
+    if ((docker_rules)); then
+        warn "Docker firewall rollback requires verification of DOCKER-USER rules; no chain is flushed automatically."
     fi
     ((docker_daemon)) && warn "$(tr_ 'daemon.json восстановлен. Примените: systemctl restart docker' 'daemon.json restored. Apply: systemctl restart docker')"
     if ((ssh_touched)); then
@@ -1290,6 +1326,10 @@ fi
 $(tr_ 'Нужна перезагрузка: reboot' 'Reboot required: reboot')"
 
 log "$report"
+overall_rc=0
+for r in "${RESULTS[@]}"; do
+    case $r in FAIL\|*) overall_rc=1 ;; esac
+done
 echo; printf '%s\n' "$final"
 ((USE_TUI)) && ui_msg "$(tr_ 'Готово' 'Done')" "$final"
-exit 0
+exit "$overall_rc"
