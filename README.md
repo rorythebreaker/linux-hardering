@@ -1,17 +1,23 @@
 # linux-hardering
 
-Bash toolkit for initial Debian/Ubuntu server hardening (RU/EN).
+Linux hardening toolkit for Debian/Ubuntu. Current version: **2.2**.
 
-## Files
+## Features
 
-- [`linux-harden.sh`](./linux-harden.sh) — original v2.0 script.
-- [`development`](../../tree/development) — development branch (v2.2 script upload still pending).
+- Interactive RU/EN TUI and configuration-driven operation
+- SSH hardening, firewall, Fail2ban, auditing and system security settings
+- Multiple SSH public keys for the administrator (`PUBKEYS` separated by `|`)
+- Dry-run support and configuration backups
 
-## Usage
+## Run
 
 ```bash
 sudo bash linux-harden.sh --help
 sudo bash linux-harden.sh --dry-run
 ```
 
-**Security warning:** Test on a disposable VM with console access before changing SSH, firewall or Docker networking. The original script is not production-validated. Version 2.2, including multiple SSH public keys, is not yet published in this repository.
+## Multiple SSH keys
+
+Set `KEY_SOURCE='paste'` and specify one key in `PUBKEY` and additional keys in `PUBKEYS`, separated by `|`. The interactive setup also supports adding multiple keys. Existing authorized keys are preserved and duplicates skipped.
+
+**Warning:** Test on a disposable VM with console access before changing SSH or firewall settings. Full integration testing has not been performed.
